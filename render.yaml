@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: timeblindness-api
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: MONGO_URL
+        sync: false
+      - key: DB_NAME
+        value: family
+      - key: PYTHON_VERSION
+        value: 3.12.7
