@@ -1,11 +1,13 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends
+from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends, Request
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
-import random
+import secrets
 import string
+import time
+from collections import defaultdict, deque
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -28,19 +30,6 @@ app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
 
-# ============================================================
-# Legacy status check (kept for template compatibility)
-# ============================================================
-class StatusCheck(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-
-
-class StatusCheckCreate(BaseModel):
-    client_name: str
-
-
 @api_router.get("/")
 async def root():
     return {"message": "Hello World"}
@@ -52,20 +41,6 @@ async def health():
     return {"ok": True}
 
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.dict()
-    status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
-    return status_obj
-
-
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**status_check) for status_check in status_checks]
-
-
 # ============================================================
 # Family Tasks feature (Groups model)
 # ============================================================
@@ -75,6 +50,43 @@ async def get_status_checks():
 #   family_invites:{ code, group_id, created_by, created_at, expires_at, used }
 #   family_tasks:  { id, group_id, text, checked, created_by, created_at, updated_at }
 # ============================================================
+
+# --------- Limits ---------
+MAX_NAME_LEN = 40
+MAX_GROUP_NAME_LEN = 60
+MAX_TASK_TEXT_LEN = 500
+MAX_TASKS_PER_GROUP = 500
+MAX_GROUPS_PER_USER = 50
+INVITE_TTL_MINUTES = 30
+
+
+# --------- Simple in-memory rate limiting ---------
+# Single Render instance, so a per-process sliding window is enough.
+_rl_hits: dict = defaultdict(deque)
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_limit(bucket: str, key: str, limit: int, window_s: int) -> None:
+    now = time.monotonic()
+    q = _rl_hits[(bucket, key)]
+    while q and now - q[0] > window_s:
+        q.popleft()
+    if len(q) >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many attempts. Please wait a few minutes and try again.",
+        )
+    q.append(now)
+    # keep memory bounded
+    if len(_rl_hits) > 50000:
+        _rl_hits.clear()
+
 
 # --------- Models ---------
 class RegisterRequest(BaseModel):
@@ -140,11 +152,11 @@ class TaskOut(BaseModel):
 
 
 class TaskCreate(BaseModel):
-    text: str = ""
+    text: str = Field(default="", max_length=MAX_TASK_TEXT_LEN)
 
 
 class TaskUpdate(BaseModel):
-    text: Optional[str] = None
+    text: Optional[str] = Field(default=None, max_length=MAX_TASK_TEXT_LEN)
     checked: Optional[bool] = None
 
 
@@ -153,17 +165,22 @@ def _generate_invite_code() -> str:
     """Return a friendly short code like 'AB7-K3X'."""
     alphabet = string.ascii_uppercase + string.digits
     alphabet = "".join(c for c in alphabet if c not in "0O1IL")
-    part1 = "".join(random.choices(alphabet, k=3))
-    part2 = "".join(random.choices(alphabet, k=3))
+    part1 = "".join(secrets.choice(alphabet) for _ in range(3))
+    part2 = "".join(secrets.choice(alphabet) for _ in range(3))
     return f"{part1}-{part2}"
 
 
-async def _get_current_user(authorization: Optional[str] = Header(None)):
+async def _get_current_user(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
     token = authorization[len("Bearer "):].strip()
-    user = await db.family_users.find_one({"token": token})
+    user = await db.family_users.find_one({"token": token}) if token else None
     if not user:
+        # Only failed logins count toward the limit (stops token guessing).
+        _rate_limit("bad_token", _client_ip(request), limit=30, window_s=600)
         raise HTTPException(status_code=401, detail="Invalid token")
     return user
 
@@ -211,6 +228,29 @@ async def _ensure_member(group_id: str, user_id: str) -> dict:
     return group
 
 
+# --------- Startup: indexes ---------
+@app.on_event("startup")
+async def _ensure_indexes():
+    """Create indexes so lookups don't scan whole collections. Never fatal."""
+    specs = [
+        (db.family_users, [("token", 1)], {}),
+        (db.family_users, [("user_id", 1)], {}),
+        (db.family_groups, [("group_id", 1)], {}),
+        (db.family_groups, [("member_ids", 1)], {}),
+        (db.family_invites, [("code", 1)], {}),
+        (db.family_invites, [("group_id", 1)], {}),
+        # Auto-remove invites one day after they expire.
+        (db.family_invites, [("expires_at", 1)], {"expireAfterSeconds": 86400}),
+        (db.family_tasks, [("group_id", 1), ("created_at", 1)], {}),
+        (db.family_tasks, [("id", 1)], {}),
+    ]
+    for coll, keys, opts in specs:
+        try:
+            await coll.create_index(keys, **opts)
+        except Exception as e:  # pragma: no cover
+            logging.warning(f"Index warning on {coll.name} {keys}: {e}")
+
+
 # --------- Startup migration ---------
 @app.on_event("startup")
 async def _migrate_connections_to_groups():
@@ -252,15 +292,16 @@ async def _migrate_connections_to_groups():
 # --------- User endpoints ---------
 
 @api_router.post("/family/register", response_model=RegisterResponse)
-async def family_register(payload: RegisterRequest):
+async def family_register(payload: RegisterRequest, request: Request):
+    _rate_limit("register", _client_ip(request), limit=30, window_s=3600)
     name = (payload.name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Name is required")
-    if len(name) > 40:
-        name = name[:40]
+    if len(name) > MAX_NAME_LEN:
+        name = name[:MAX_NAME_LEN]
 
     user_id = str(uuid.uuid4())
-    token = uuid.uuid4().hex + uuid.uuid4().hex
+    token = secrets.token_hex(32)
     doc = {
         "user_id": user_id,
         "token": token,
@@ -284,13 +325,48 @@ async def family_update_me(
     name = (payload.name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Name is required")
-    if len(name) > 40:
-        name = name[:40]
+    if len(name) > MAX_NAME_LEN:
+        name = name[:MAX_NAME_LEN]
     await db.family_users.update_one(
         {"user_id": current["user_id"]},
         {"$set": {"name": name}},
     )
     return {"user_id": current["user_id"], "name": name}
+
+
+@api_router.delete("/family/me")
+async def family_delete_me(current=Depends(_get_current_user)):
+    """Delete my account and my data (GDPR / Google Play account deletion).
+
+    - Groups where I am the only member: deleted with all their tasks + invites.
+    - Shared groups: I am removed; tasks I created there are deleted.
+    - Invites I created are deleted. Finally my user record is deleted.
+    """
+    uid = current["user_id"]
+    groups_deleted = 0
+    groups_left = 0
+    async for g in db.family_groups.find({"member_ids": uid}):
+        gid = g["group_id"]
+        remaining = [m for m in (g.get("member_ids") or []) if m != uid]
+        if not remaining:
+            await db.family_groups.delete_one({"group_id": gid})
+            await db.family_tasks.delete_many({"group_id": gid})
+            await db.family_invites.delete_many({"group_id": gid})
+            groups_deleted += 1
+        else:
+            await db.family_groups.update_one(
+                {"group_id": gid}, {"$pull": {"member_ids": uid}}
+            )
+            groups_left += 1
+    tasks = await db.family_tasks.delete_many({"created_by": uid})
+    await db.family_invites.delete_many({"created_by": uid})
+    await db.family_users.delete_one({"user_id": uid})
+    return {
+        "ok": True,
+        "groups_deleted": groups_deleted,
+        "groups_left": groups_left,
+        "tasks_deleted": tasks.deleted_count,
+    }
 
 
 # --------- Group endpoints ---------
@@ -301,10 +377,13 @@ async def family_create_group(
     current=Depends(_get_current_user),
 ):
     """Create a new group with just the current user as first member."""
+    count = await db.family_groups.count_documents({"member_ids": current["user_id"]})
+    if count >= MAX_GROUPS_PER_USER:
+        raise HTTPException(status_code=400, detail="You have reached the maximum number of groups")
     group_id = str(uuid.uuid4())
     name = (payload.name or "").strip() if payload.name else ""
-    if len(name) > 60:
-        name = name[:60]
+    if len(name) > MAX_GROUP_NAME_LEN:
+        name = name[:MAX_GROUP_NAME_LEN]
     doc = {
         "group_id": group_id,
         "name": name,
@@ -346,8 +425,8 @@ async def family_rename_group(
 ):
     group = await _ensure_member(group_id, current["user_id"])
     name = (payload.name or "").strip()
-    if len(name) > 60:
-        name = name[:60]
+    if len(name) > MAX_GROUP_NAME_LEN:
+        name = name[:MAX_GROUP_NAME_LEN]
     await db.family_groups.update_one(
         {"group_id": group_id},
         {"$set": {"name": name}},
@@ -391,12 +470,13 @@ async def family_create_invite(
 ):
     """Generate a fresh invitation code for THIS group, valid 30 minutes."""
     await _ensure_member(group_id, current["user_id"])
+    _rate_limit("invite", current["user_id"], limit=20, window_s=3600)
     for _ in range(5):
         code = _generate_invite_code()
         existing = await db.family_invites.find_one({"code": code, "used": False})
         if not existing:
             break
-    expires = datetime.utcnow() + timedelta(minutes=30)
+    expires = datetime.utcnow() + timedelta(minutes=INVITE_TTL_MINUTES)
     doc = {
         "code": code,
         "group_id": group_id,
@@ -412,9 +492,13 @@ async def family_create_invite(
 @api_router.post("/family/accept-invite", response_model=AcceptInviteResponse)
 async def family_accept_invite(
     payload: AcceptInviteRequest,
+    request: Request,
     current=Depends(_get_current_user),
 ):
-    code = (payload.code or "").strip().upper()
+    # Limit code guessing per device and per network.
+    _rate_limit("join_user", current["user_id"], limit=10, window_s=600)
+    _rate_limit("join_ip", _client_ip(request), limit=60, window_s=600)
+    code = (payload.code or "").strip().upper()[:20]
     if not code:
         raise HTTPException(status_code=400, detail="Code is required")
 
@@ -480,6 +564,9 @@ async def family_create_task(
     current=Depends(_get_current_user),
 ):
     await _ensure_member(group_id, current["user_id"])
+    n = await db.family_tasks.count_documents({"group_id": group_id})
+    if n >= MAX_TASKS_PER_GROUP:
+        raise HTTPException(status_code=400, detail="This list is full. Delete some tasks first.")
     now = datetime.utcnow()
     task = {
         "id": str(uuid.uuid4()),
@@ -511,7 +598,7 @@ async def family_update_task(
         update["text"] = payload.text
     if payload.checked is not None:
         update["checked"] = payload.checked
-    await db.family_tasks.update_one({"id": task_id}, {"$set": update})
+    await db.family_tasks.update_one({"id": task_id, "group_id": group_id}, {"$set": update})
     task.update(update)
     return TaskOut(
         id=task["id"],
